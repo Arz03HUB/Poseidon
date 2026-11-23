@@ -1,0 +1,69 @@
+// Contraseñas con scrypt y sesiones con JWT.
+import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
+import jwt from 'jsonwebtoken';
+import './config.js';
+
+export const ROLES = ['administrador', 'operativo', 'cliente', 'monitoreo', 'comprador'];
+
+const SECRETO = process.env.JWT_SECRET && process.env.JWT_SECRET !== 'cambie-este-valor'
+  ? process.env.JWT_SECRET
+  : randomBytes(32).toString('hex'); // sin JWT_SECRET las sesiones se pierden al reiniciar
+
+export function hashPassword(clave) {
+  const sal = randomBytes(16);
+  return `${sal.toString('hex')}:${scryptSync(clave, sal, 64).toString('hex')}`;
+}
+
+export function verificarPassword(clave, guardado) {
+  const [sal, hash] = String(guardado).split(':');
+  if (!sal || !hash) return false;
+  const esperado = Buffer.from(hash, 'hex');
+  const calculado = scryptSync(String(clave), Buffer.from(sal, 'hex'), esperado.length);
+  return timingSafeEqual(esperado, calculado);
+}
+
+export const crearToken = (u) => jwt.sign({ id: u.id, rol: u.rol }, SECRETO, { expiresIn: '12h' });
+
+// Middleware: exige sesión válida y usuario activo, y adjunta los permisos vigentes de su rol.
+// buscarUsuario(id) y permisosDeRol(rol) vienen de db.js. Los permisos se leen en cada petición,
+// así un cambio del administrador rige de inmediato, sin volver a ingresar.
+export function requiereSesion(buscarUsuario, permisosDeRol) {
+  return async (req, res, next) => {
+    try {
+      const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+      const { id } = jwt.verify(token, SECRETO);
+      const u = await buscarUsuario(id);
+      if (!u || !u.activo) throw new Error('inactivo');
+      req.usuario = { id: u.id, nombre: u.nombre, email: u.email, rol: u.rol };
+    } catch {
+      return res.status(401).json({ error: 'Sesión no válida. Ingrese de nuevo.' });
+    }
+    try {
+      req.usuario.permisos = await permisosDeRol(req.usuario.rol);
+      next();
+    } catch (e) {
+      next(e);
+    }
+  };
+}
+
+export const tienePermiso = (u, permiso) => u.permisos.includes(permiso);
+
+// Exige al menos uno de los permisos indicados.
+export const requierePermiso = (...permisos) => (req, res, next) => (
+  permisos.some((p) => tienePermiso(req.usuario, p))
+    ? next()
+    : res.status(403).json({ error: 'Su rol no tiene permiso para esto.' })
+);
+
+// Límite simple de intentos de ingreso por IP (en memoria).
+const intentos = new Map();
+export function limiteIngreso(req, res, next) {
+  const ahora = Date.now();
+  const r = intentos.get(req.ip) || { n: 0, desde: ahora };
+  if (ahora - r.desde > 15 * 60 * 1000) { r.n = 0; r.desde = ahora; }
+  r.n += 1;
+  intentos.set(req.ip, r);
+  if (r.n > 20) return res.status(429).json({ error: 'Demasiados intentos. Espere unos minutos.' });
+  next();
+}
